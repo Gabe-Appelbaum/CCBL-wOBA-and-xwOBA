@@ -1,0 +1,234 @@
+---
+title: "calculating cape wOBA"
+author: "me"
+date: "2024-07-07"
+output: html_document
+---
+
+```{r}
+knitr::opts_knit$set(root.dir = "C:/Users/gabe2/Desktop/Cape work")
+setwd("C:/Users/gabe2/Desktop/Cape work")
+library(tidyverse)
+
+PBP_23 <- read_csv("data/full_pbp_23.csv")%>%
+      mutate(Year = 2023)
+
+PBP_21_22 <- read_csv("data/full_pbp.csv") %>%
+      mutate(Year = format(as.Date(Date, format = "%m/%d/%Y"), "%Y")) %>%
+      select(-Date) %>%
+      filter(Year > 2020)
+```
+
+```{r}
+PBP_23 <- PBP_23 %>%
+      select("GameID", "Inning", "Top_Btm", "Outs", "BatterName",
+             "PAResult", "RunningEvent", "BaseOutEvent", "Description",
+             "Runner1B", "Runner2B", "Runner3B", 
+             "InningPACount", "PitchNumPA", "TeamRuns", "RunsScoredOnPlay", "Year")
+
+PBP_21_22 <- PBP_21_22 %>%
+      select("GameID", "Inning", "Top_Btm", "Outs", "BatterName",
+             "PAResult", "RunningEvent", "BaseOutEvent", "Description",
+             "Runner1B", "Runner2B", "Runner3B", 
+             "InningPACount", "PitchNumPA", "TeamRuns", "RunsScoredOnPlay", "Year")
+
+PBP <- rbind(PBP_21_22, PBP_23)
+
+rm(PBP_21_22, PBP_23)
+```
+
+
+```{r}
+
+PBP <- PBP %>% 
+      drop_na(Outs) %>% # remove the pinch runner
+      mutate(
+            # convert runners to dummy variables
+            Runner1B = case_when(
+                  is.na(Runner1B) == F ~ 1,
+                  T ~ 0
+            ),
+            Runner2B = case_when(
+                  is.na(Runner2B) == F ~ 1,
+                  T ~ 0
+            ),
+            Runner3B = case_when(
+                  is.na(Runner3B) == F ~ 1,
+                  T ~ 0
+            ),
+            # establish game state
+            # example game state, 2 outs and bases juiced would be 2111
+            GameState = paste0(Outs, Runner1B, Runner2B, Runner3B)
+      ) %>%
+      filter(is.na(PAResult) == F | RunningEvent == T | BaseOutEvent == T)
+```
+
+# Use hahn's loop to create runs rest of inning
+```{r}
+# Group by half inning
+PBP <- PBP %>% 
+      mutate(half_inn_id = paste(GameID, Top_Btm, Inning, sep = "-"))
+
+# this df is half innings with outs in them and runs in them
+half_innings <- PBP %>%
+  arrange(half_inn_id, InningPACount, PitchNumPA) %>%
+  mutate(OutsOnPlay = (lead(Outs) - Outs) %% 3) %>%
+  group_by(half_inn_id) %>%
+  summarize(RunsInInning = sum(RunsScoredOnPlay), OutsInInning = sum(OutsOnPlay))
+
+# Join on half inning to get a runs scored in each inning
+join_PBP <- PBP %>%
+  inner_join(half_innings, by = "half_inn_id")
+
+# Make sure 3 outs in inning, dummy var at start of inning
+PBP_3outs <- join_PBP %>%
+  filter(OutsInInning == 3) %>%
+  mutate(NewInning = if_else(half_inn_id == lag(half_inn_id, default = "0"), 0, 1))
+
+# Calculate runs already scored and yet to be scored
+PBP_3outs %>% 
+  group_by(grp = cumsum(NewInning == 1)) %>% 
+  mutate(AlreadyScored = cumsum(RunsScoredOnPlay) - RunsScoredOnPlay) %>% 
+  ungroup() %>% 
+  mutate(YetToScore = RunsInInning - AlreadyScored) -> run_vars
+```
+
+# for loop to remove duplicate game states
+```{r}
+# selected_row <- c()
+# 
+# for (i in 1:(nrow(run_vars) - 1)){
+#       if(
+#             !is.na(run_vars$GameState[i]) & !is.na(run_vars$GameState[i+1]) & 
+#             run_vars$GameState[i] == run_vars$GameState[i+1] &
+#             run_vars$InningPACount[i] == run_vars$InningPACount[i+1]
+#             
+#             ) 
+#             {selected_row <- c(selected_row, i+1)}
+# }
+# 
+# run_vars <- run_vars[-selected_row,]
+```
+
+# create RE24
+```{r}
+#run_vars23 <- run_vars %>% filter(Year == 2023)
+
+# RE24_23 <- run_vars %>%
+#       filter(Year == 2023) %>%
+#       group_by(GameState) %>%
+#       summarize(
+#             instances = n(),
+#             sum_runs_yet_score = sum(YetToScore, na.rm = T),
+#             expected_runs = sum_runs_yet_score / instances
+#       )
+# 
+# RE24_22 <- run_vars %>%
+#       filter(Year == 2022) %>%
+#       group_by(GameState) %>%
+#       summarize(
+#             instances = n(),
+#             sum_runs_yet_score = sum(YetToScore, na.rm = T),
+#             expected_runs = sum_runs_yet_score / instances
+#       )
+# 
+# RE24_21 <- run_vars %>%
+#       filter(Year == 2021) %>%
+#       group_by(GameState) %>%
+#       summarize(
+#             instances = n(),
+#             sum_runs_yet_score = sum(YetToScore, na.rm = T),
+#             expected_runs = sum_runs_yet_score / instances
+#       )
+
+full_RE24 <- run_vars %>%
+      group_by(GameState) %>%
+      summarize(
+            instances = n(),
+            sum_runs_yet_score = sum(YetToScore, na.rm = T),
+            expected_runs = sum_runs_yet_score / instances
+      )
+```
+
+# now i need to create a woba event column and a delta_run_exp column in order to find the average rv delta by outcome
+```{r}
+fieldOuts <- c("Field out", "Fielder's Choice", "Field out - ground into double play",
+             "Fielder's choice", "Sacrifice fly", "Sacrifice fly - reach on error")
+
+punchies <- c("Strikeout", "Strikeout - reach on wild pitch",
+              "Strikeout - reach on error", "Strikeout - reach on passed ball", 
+              "Strikeout - reach on fielder's choice","Stikeout - reach on passed ball")
+
+PBP_withRE <- run_vars %>%
+      mutate(
+            wOBA_Event = case_when(
+                  PAResult %in% punchies ~ "Punchy",
+                  PAResult %in% fieldOuts ~ "FieldOut", # no bunts
+                  PAResult %in% c("Walk", "Intentional Walk") ~ "BB", # if youre so good they dont even try that should count
+                  PAResult == "Hit by pitch" ~ "HBP",
+                  PAResult == "Single" ~ "1B",
+                  PAResult == "Double" ~ "2B",
+                  PAResult == "Triple" ~ "3B",
+                  PAResult == "Home run" ~ "HR",
+            )
+      ) 
+
+PBP_withRE <- left_join(PBP_withRE, full_RE24, join_by(GameState)) %>%
+      select(-instances, -sum_runs_yet_score)
+
+PBP_withRE <- PBP_withRE %>%
+      mutate(
+            NextValue24 = ifelse(grp == lead(grp), lead(expected_runs), 0),
+            delta_run_exp = NextValue24 - expected_runs + RunsScoredOnPlay
+      )
+```
+
+# here we go baby, now we find mean delta rv, then get rv relative to outs, finally have wOBA RV unsclaed
+```{r}
+guts <- PBP_withRE %>%
+      filter(is.na(wOBA_Event) == F) %>%
+      group_by(wOBA_Event) %>%
+      summarise(rv = mean(delta_run_exp, na.rm = T)) %>%
+      arrange(desc(rv))
+
+# now we get rv relative to outs
+guts$rv_relOuts <- guts$rv - min(guts$rv)
+
+PBP_withRE <- left_join(PBP_withRE, guts %>% select(wOBA_Event, rv_relOuts), join_by(wOBA_Event))
+```
+
+# lets find league wOBA unscaled and league OBP in order to find wOBA scaling
+```{r}
+lgOBP <- 
+      sum(PBP_withRE$wOBA_Event %in% c("1B", "2B", "3B", "HR", "BB"))/
+      (
+      sum(PBP_withRE$wOBA_Event %in% c("1B", "2B", "3B", "HR", "BB", "Punchy", "FieldOut")) -
+      sum(PBP_withRE$PAResult %in% c("Intentional walk", "Intentional Walk"))    
+                  )
+
+lgwOBA_Unscaled <- mean(PBP_withRE$rv_relOuts, na.rm = T)
+```
+
+# now get wOBA scaling, which is rv_relOuts * (lgOBP / lgwOBA_unscaled)
+```{r}
+guts$wOBA_RV <- guts$rv_relOuts * (lgOBP / lgwOBA_Unscaled)
+```
+
+# now we can get true wOBA value and find 2023 wOBA
+```{r}
+PBP_withRE <- left_join(PBP_withRE, guts %>% select(wOBA_Event, wOBA_RV), join_by(wOBA_Event))
+
+wOBA <- PBP_withRE %>%
+      group_by(BatterName) %>%
+      summarise(
+            wOBA = round(mean(wOBA_RV, na.rm = T), 3),
+            PA = n()
+            ) %>%
+      filter(PA >= 40) %>%
+      arrange(desc(wOBA))
+```
+
+```{r}
+
+```
+
